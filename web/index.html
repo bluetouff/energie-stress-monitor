@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Stress énergétique — moniteur multi-actifs</title>
+<meta name="description" content="Indice de stress des marchés de l'énergie : pétrole, gaz, électricité, positionnement. Sources primaires (EIA, ENTSO-E, GIE, CFTC, ODRE).">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header class="tape">
+    <div class="brand"><span class="sq" aria-hidden="true"></span>STRESS&nbsp;ÉNERGÉTIQUE<span class="v">v1</span></div>
+    <div class="tag">pétrole · gaz · électricité · positionnement</div>
+    <div class="pill"><span class="dot live" id="livedot" aria-hidden="true"></span><span id="snaptime">chargement…</span></div>
+  </header>
+
+  <div id="root">
+    <p class="tag" style="margin-top:30px">Lecture du snapshot…</p>
+  </div>
+
+</div>
+
+<template id="tpl-card">
+  <div class="card">
+    <div class="top">
+      <div class="lbl"></div>
+      <div class="badge"></div>
+    </div>
+    <div><span class="value"></span><span class="unit"></span></div>
+    <svg class="spark" viewBox="0 0 100 30" preserveAspectRatio="none" aria-hidden="true"></svg>
+    <div class="meta">
+      <span class="chg"></span>
+      <span class="z"></span>
+    </div>
+  </div>
+</template>
+
+<script src="app.js" defer></script>
+</body>
+</html>

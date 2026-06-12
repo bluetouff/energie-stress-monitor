@@ -1,0 +1,44 @@
+[Unit]
+Description=Build energy stress snapshot (l0g.fr)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=energie
+Group=energie
+# UMask 027 + setgid sur le dossier web => snapshot écrit en rw-r----- energie:www-data
+# (Apache le lit via le groupe, jamais world-readable, sans chmod manuel)
+UMask=027
+EnvironmentFile=/etc/energie/env
+ExecStart=/opt/energie/venv/bin/python3 /opt/energie/builder.py
+TimeoutStartSec=180
+Nice=10
+
+# --- Durcissement ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+# AF_UNIX requis pour la résolution DNS via systemd-resolved (nss-resolve)
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# accès en lecture au dossier web (groupe www-data) pour écrire le snapshot
+SupplementaryGroups=www-data
+ReadWritePaths=/var/www/html/energie
+
+[Install]
+WantedBy=multi-user.target

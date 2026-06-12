@@ -1,0 +1,26 @@
+# --- Secrets : ne JAMAIS committer ---
+env
+.env
+*.key
+*.pem
+*.crt
+secrets*
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# --- OS / éditeurs ---
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+
+# --- Données de prod ---
+# Le builder régénère web/snapshot.json sur le serveur.
+# Un échantillon synthétique est versionné pour que le front s'affiche après clone.
+# Décommenter si tu préfères ne pas versionner l'échantillon :
+# web/snapshot.json

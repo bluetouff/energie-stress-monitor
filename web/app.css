@@ -1,0 +1,151 @@
+/* ============================================================
+   Moniteur de stress énergétique — l0g.fr
+   Identité "terminal éditorial" (yct.l0g.fr / 13flow / bluetouff.com) :
+   fond #1a1a1a, accent cyan #00f0d0, texte menthe, scanlines CRT,
+   hairlines cyan pointillées, inversion au survol. Zéro CDN, zéro police externe.
+   L'échelle de stress est remappée sur la palette signature :
+   cyan = détendu (pôle calme) -> ambre -> orange -> rose = crise (pôle risque).
+   ============================================================ */
+
+/* Pour un match au pixel près, déposer les woff2 Fontsource dans ce dossier
+   et décommenter (mêmes polices que l0g.fr) :
+@font-face{font-family:"Share Tech Mono";src:url(share-tech-mono.woff2) format("woff2");font-display:swap}
+@font-face{font-family:"VT323";src:url(vt323.woff2) format("woff2");font-display:swap}
+*/
+
+:root{
+  --bg:#1a1a1a;
+  --panel:#202020;
+  --panel2:#171717;
+  --inset:#141414;
+  --line:rgba(0,240,208,.16);
+  --line-soft:rgba(0,240,208,.09);
+  --text:#b8fff5;
+  --dim:#6f9b94;
+  --faint:#456b65;
+
+  /* échelle de stress sur la palette terminal */
+  --cool:#00f0d0;   /* détendu — accent cyan signature (pôle calme) */
+  --warm:#e0b341;   /* normal  — ambre terminal */
+  --hot:#ff9d5c;    /* tendu   — orange (transition vers le risque) */
+  --crit:#ff6b9d;   /* crise   — prompt rose (pôle risque) */
+  --info:#00f0d0;   /* live / neutre */
+
+  --mono:ui-monospace,SFMono-Regular,"SF Mono","Share Tech Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  --display:"VT323",var(--mono);
+  --sans:var(--mono);
+}
+
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans)}
+body{-webkit-font-smoothing:antialiased;line-height:1.5;
+  background-image:radial-gradient(1100px 600px at 50% -10%, rgba(0,240,208,.05), transparent 60%);}
+
+/* CRT : scanlines + vignette discrètes */
+body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:9;
+  background:repeating-linear-gradient(0deg, rgba(0,0,0,0) 0, rgba(0,0,0,0) 2px, rgba(0,0,0,.18) 3px);
+  mix-blend-mode:multiply;opacity:.5}
+body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:8;
+  background:radial-gradient(120% 120% at 50% 50%, transparent 60%, rgba(0,0,0,.35))}
+
+a{color:var(--cool);text-decoration:none;border-bottom:1px dotted var(--line)}
+a:hover{background:var(--cool);color:var(--bg);border-bottom-color:var(--cool)}
+::selection{background:var(--cool);color:#0a0a0a}
+
+.wrap{max-width:1200px;margin:0 auto;padding:20px 18px 90px;position:relative;z-index:1}
+
+/* ---------- En-tête ---------- */
+header.tape{display:flex;flex-wrap:wrap;align-items:center;gap:10px 20px;
+  border-bottom:1px dotted var(--line);padding-bottom:14px;margin-bottom:8px}
+.brand{font-weight:700;font-size:19px;letter-spacing:.02em;display:flex;align-items:baseline;gap:9px;text-transform:uppercase}
+.brand .sq{display:inline-block;width:11px;height:11px;
+  background:linear-gradient(135deg,var(--cool),var(--crit));
+  box-shadow:0 0 9px rgba(0,240,208,.6)}
+.brand .v{color:var(--faint);font-weight:400;font-size:12px}
+.tag{font-size:11.5px;color:var(--dim);letter-spacing:.02em}
+.pill{margin-left:auto;font-size:11px;color:var(--dim);
+  border:1px dotted var(--line);padding:5px 11px;display:flex;gap:8px;align-items:center}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--faint)}
+.dot.live{background:var(--cool);box-shadow:0 0 0 0 rgba(0,240,208,.6);animation:ping 2.4s infinite}
+@keyframes ping{0%{box-shadow:0 0 0 0 rgba(0,240,208,.5)}70%{box-shadow:0 0 0 6px rgba(0,240,208,0)}100%{box-shadow:0 0 0 0 rgba(0,240,208,0)}}
+
+/* ---------- Hero : jauge composite ---------- */
+.hero{display:grid;grid-template-columns:1.15fr .85fr;gap:22px;margin:22px 0 26px;align-items:stretch}
+.gaugecard{background:var(--panel);border:1px dotted var(--line);padding:22px 22px 18px;position:relative;overflow:hidden}
+.gaugecard .eyebrow{font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:var(--cool)}
+.composite-num{display:flex;align-items:baseline;gap:14px;margin:6px 0 4px}
+.composite-num .score{font-family:var(--display);font-size:64px;font-weight:400;line-height:.95;letter-spacing:.01em;color:var(--text)}
+.composite-num .regime{font-size:22px;font-weight:700;text-transform:uppercase;letter-spacing:.03em}
+.driver{color:var(--dim);font-size:13px;max-width:50ch;margin-top:2px}
+
+/* barre de stress */
+.thermal{margin-top:18px;height:15px;position:relative;
+  background:linear-gradient(90deg,var(--cool) 0%,var(--warm) 45%,var(--hot) 70%,var(--crit) 100%);
+  box-shadow:inset 0 0 0 1px rgba(0,0,0,.4)}
+.thermal .ticks{position:absolute;inset:0;display:flex;justify-content:space-between;padding:0 .5%;pointer-events:none}
+.thermal .ticks i{width:1px;background:rgba(0,0,0,.4)}
+.needle{position:absolute;top:-7px;width:3px;height:29px;background:var(--text);
+  transform:translateX(-50%);box-shadow:0 0 0 2px var(--panel),0 0 8px rgba(184,255,245,.5)}
+.thermal-labels{display:flex;justify-content:space-between;margin-top:9px;
+  font-size:10.5px;letter-spacing:.05em;color:var(--faint);text-transform:uppercase}
+
+/* rails sous-indices */
+.drivers{background:var(--panel);border:1px dotted var(--line);padding:18px}
+.drivers h3{margin:0 0 12px;font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--cool);font-weight:400}
+.rail{display:grid;grid-template-columns:96px 1fr 42px;gap:10px;align-items:center;margin:11px 0}
+.rail .name{font-size:13px;color:var(--text)}
+.rail .track{height:8px;background:var(--inset);position:relative;overflow:hidden;border:1px solid var(--line-soft)}
+.rail .fill{position:absolute;top:0;left:0;height:100%}
+.rail .val{font-size:13px;text-align:right;font-weight:700}
+
+/* ---------- Grille des séries ---------- */
+.section-h{display:flex;align-items:baseline;gap:12px;margin:30px 0 12px}
+.section-h h2{font-size:12px;margin:0;letter-spacing:.16em;text-transform:uppercase;color:var(--cool);font-weight:400}
+.section-h .hr{flex:1;height:0;border-top:1px dotted var(--line)}
+
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:13px}
+.card{background:var(--panel);border:1px dotted var(--line);padding:14px 14px 12px;
+  position:relative;display:flex;flex-direction:column;gap:8px;min-height:128px}
+.card.stale{opacity:.55}
+.card .top{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
+.card .lbl{font-size:12px;color:var(--dim);line-height:1.3}
+.badge{font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;padding:2px 6px;
+  border:1px solid currentColor;white-space:nowrap}
+.card .value{font-family:var(--display);font-size:27px;font-weight:400;letter-spacing:.01em;line-height:1;color:var(--text)}
+.card .unit{font-size:11px;color:var(--faint);margin-left:5px}
+.card .meta{display:flex;gap:12px;font-size:11px;color:var(--dim);margin-top:auto}
+.card .chg.up{color:var(--crit)}
+.card .chg.down{color:var(--cool)}
+.card .z{color:var(--faint)}
+.card .dt{color:var(--faint);margin-left:auto}
+.spark{width:100%;height:30px;display:block}
+.stale-tag{position:absolute;top:10px;right:10px;font-size:9px;color:var(--warm);letter-spacing:.05em}
+
+.card.live{border-style:solid;border-color:var(--line);
+  box-shadow:inset 0 0 0 1px rgba(0,240,208,.06)}
+
+/* ---------- Footer / méthodo ---------- */
+.foot{margin-top:34px;border-top:1px dotted var(--line);padding-top:18px;
+  display:grid;grid-template-columns:1.3fr 1fr;gap:24px}
+.foot h4{margin:0 0 8px;font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--cool);font-weight:400}
+.foot p,.foot li{font-size:12.5px;color:var(--dim);line-height:1.6}
+.foot ul{margin:0;padding-left:0;list-style:none}
+.foot li{padding:3px 0;border-bottom:1px dotted var(--line-soft);display:flex;justify-content:space-between;gap:12px}
+.foot li span{color:var(--faint);font-size:11px;text-align:right}
+.note{color:var(--warm);font-size:12px}
+
+.err{background:var(--panel);border:1px dotted var(--crit);padding:16px;color:var(--text);font-size:13px;margin:18px 0}
+
+/* ---------- Responsive ---------- */
+@media (max-width:920px){
+  .hero{grid-template-columns:1fr}
+  .grid{grid-template-columns:repeat(2,1fr)}
+  .foot{grid-template-columns:1fr}
+}
+@media (max-width:520px){
+  .grid{grid-template-columns:1fr}
+  .composite-num .score{font-size:54px}
+}
+@media (prefers-reduced-motion:reduce){.dot.live{animation:none}}
+@media (prefers-reduced-motion:no-preference){}
+:focus-visible{outline:2px solid var(--cool);outline-offset:2px}

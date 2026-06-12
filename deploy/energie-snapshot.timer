@@ -1,0 +1,13 @@
+[Unit]
+Description=Refresh energy stress snapshot every 30 min (l0g.fr)
+
+[Timer]
+# Prix EIA/ENTSO-E bougent en journée ; stockage GIE (1x/j 19h30 CET) et
+# CFTC (hebdo, vendredi) ne pénalisent pas un cycle plus court.
+OnBootSec=3min
+OnUnitActiveSec=30min
+RandomizedDelaySec=120
+Persistent=true
+
+[Install]
+WantedBy=timers.target
