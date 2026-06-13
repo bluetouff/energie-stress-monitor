@@ -82,7 +82,7 @@ Toutes primaires, toutes gratuites.
 
 | Indicateur | Source | Clé | Voie |
 |---|---|---|---|
-| Brent, WTI | Yahoo Finance `BZ=F` / `CL=F` (repli EIA `PET.RBRTE.D`/`PET.RWTC.D`) | non (repli: oui) | builder |
+| Brent, WTI | historique EIA `PET.RBRTE.D`/`PET.RWTC.D` + spot frais oilpriceapi (`BRENT_CRUDE_USD`/`WTI_USD`) | oui | builder |
 | Stocks bruts US (hors SPR) | EIA `PET.WCESTUS1.W` | oui | builder |
 | Henry Hub (spot) | EIA `NG.RNGWHHD.D` | oui | builder |
 | Stockage gaz Europe (% plein) | GIE AGSI+ `?continent=eu` (champ `full`) | oui (`x-key`) | builder |
@@ -277,6 +277,8 @@ jambes (prix day-ahead FR + DE-LU) et entre pleinement dans le composite.
   démarrage. Déployer en HTTP seul, laisser certbot créer le bloc TLS.
 - **Permission refusée sur `/etc/energie/env`** : vérifier que le **dossier** `/etc/energie`
   est bien `root:energie 750` (sinon le service ne peut pas traverser jusqu'au fichier).
+- **Pétrole figé / laggé** : `OILPRICE_KEY` absente ou quota épuisé → on retombe sur le
+  spot EIA (officiel mais laggé). Vérifier la clé oilpriceapi dans `/etc/energie/env`.
 - **Yahoo renvoie HTTP 429** : rate-limit de l'IP. Le builder retombe automatiquement
   sur EIA (prix réels mais laggés de quelques jours). Pour la fraîcheur durable, ajouter
   la gestion cookie+crumb Yahoo. Sources alternatives sans clé : stooq (souvent protégé
@@ -320,9 +322,10 @@ cd web && python3 -m http.server 8000
 
 - Pas de prix **TTF** propre en API gratuite : la tension gaz européenne passe par le
   stockage GIE. Carbone **EUA** non inclus (pas de flux gratuit fiable).
-- **Pétrole** : Brent/WTI viennent de Yahoo Finance (clôture du jour + prix temps réel), avec
-  repli automatique sur le spot EIA (laggé ~4-7 j) si Yahoo rate-limite. Chaque carte affiche
-  sa date pour rendre tout décalage visible.
+- **Pétrole** : l'historique (z-score) vient du spot EIA officiel ; la tête de série (prix
+  affiché) est rafraîchie par oilpriceapi.com (temps réel, gratuit). Sans `OILPRICE_KEY`, on
+  reste sur le spot EIA seul (laggé de quelques jours). Chaque carte affiche sa date.
+  Yahoo Finance reste disponible en option (`ENERGIE_YAHOO_OIL=1`) mais rate-limite les IP serveur.
 - `contexte` (EUR/USD) est fetché live côté navigateur, donc absent du composite serveur
   (renormalisé sur les autres sous-indices).
 

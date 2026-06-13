@@ -26,7 +26,9 @@ import os
 import sys
 import json
 import math
+import time
 import statistics
+import http.cookiejar
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -236,13 +238,67 @@ def fetch_eia_series(series_id, length=900):
     return drop_outliers(out)
 
 
+_YAHOO_UA = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+_YAHOO_HEADERS = {
+    "User-Agent": _YAHOO_UA,
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
+    "Referer": "https://finance.yahoo.com/",
+    "Connection": "keep-alive",
+}
+_YAHOO_CJ = http.cookiejar.CookieJar()
+_YAHOO_OPENER = urllib.request.build_opener(
+    _HTTPSRedirectOnly(), urllib.request.HTTPCookieProcessor(_YAHOO_CJ))
+_yahoo_primed = False
+
+
+def _yahoo_prime():
+    """Récupère un cookie de session Yahoo (réduit fortement les 429)."""
+    global _yahoo_primed
+    if _yahoo_primed:
+        return
+    for u in ("https://fc.yahoo.com/", "https://finance.yahoo.com/quote/CL=F"):
+        try:
+            _YAHOO_OPENER.open(
+                urllib.request.Request(u, headers=_YAHOO_HEADERS),
+                timeout=HTTP_TIMEOUT).read(4096)
+            break
+        except Exception:  # noqa: BLE001 — un 404 dépose souvent le cookie quand même
+            continue
+    _yahoo_primed = True
+
+
+def _yahoo_get(symbol, rng):
+    """GET chart Yahoo avec cookie, bascule query1/query2 et retry sur 429."""
+    _yahoo_prime()
+    last = None
+    for host in ("query1", "query2"):
+        url = ("https://%s.finance.yahoo.com/v8/finance/chart/%s?interval=1d&range=%s"
+               % (host, urllib.parse.quote(symbol, safe="=^"), rng))
+        for attempt in range(3):
+            try:
+                req = urllib.request.Request(url, headers=_YAHOO_HEADERS)
+                with _YAHOO_OPENER.open(req, timeout=HTTP_TIMEOUT) as r:
+                    raw = r.read(MAX_BYTES + 1)
+                if len(raw) > MAX_BYTES:
+                    raise urllib.error.URLError("réponse trop volumineuse")
+                return json.loads(raw.decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                last = e
+                if e.code == 429:
+                    time.sleep(1.5 * (attempt + 1))  # backoff puis retry
+                    continue
+                break  # autre code : on tente l'autre host
+            except Exception as e:  # noqa: BLE001
+                last = e
+                break
+    raise last or RuntimeError("Yahoo indisponible")
+
+
 def fetch_yahoo(symbol, rng="2y"):
     """Yahoo Finance chart : [(date, close)] ancien->récent, dernier point = prix
-    temps réel (meta.regularMarketPrice). UA navigateur requis."""
-    url = ("https://query1.finance.yahoo.com/v8/finance/chart/%s?interval=1d&range=%s"
-           % (urllib.parse.quote(symbol, safe="=^"), rng))
-    data = http_json(url, headers={
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"})
+    temps réel (meta.regularMarketPrice). Robuste : cookie + query1/2 + retry 429."""
+    data = _yahoo_get(symbol, rng)
     res = data.get("chart", {}).get("result")
     if not res:
         raise RuntimeError("réponse Yahoo vide")
@@ -268,22 +324,67 @@ def fetch_yahoo(symbol, rng="2y"):
     return drop_outliers(out)
 
 
-def fetch_brent():
-    """Brent : Yahoo (frais) avec repli EIA."""
+# Yahoo désactivé par défaut : l'API rate-limite (429) les IP de serveur.
+# Mettre ENERGIE_YAHOO_OIL=1 dans l'env pour tenter Yahoo (frais) si l'IP n'est
+# pas bannie ; sinon on reste sur le spot EIA officiel (fiable, laggé de quelques jours).
+USE_YAHOO_OIL = os.environ.get("ENERGIE_YAHOO_OIL", "").strip().lower() in ("1", "true", "yes")
+
+OILPRICE_KEY = os.environ.get("OILPRICE_KEY", "").strip()
+
+
+def fetch_oilprice_latest(code):
+    """oilpriceapi.com : (date, prix) du dernier spot. None si indisponible.
+    Sert à rafraîchir la tête de série EIA avec un prix temps réel."""
+    if not OILPRICE_KEY:
+        return None
     try:
-        return fetch_yahoo("BZ=F")
+        url = "https://api.oilpriceapi.com/v1/prices/latest?by_code=" + urllib.parse.quote(code)
+        raw = http_get(url, headers={"Authorization": "Token " + OILPRICE_KEY})
+        d = json.loads(raw.decode("utf-8"))
+        if d.get("status") != "success":
+            return None
+        node = d.get("data", {})
+        price = node.get("price")
+        ts = node.get("created_at") or node.get("updated_at")
+        if price is None or not ts:
+            return None
+        day = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(timezone.utc).date()
+        return (day, float(price))
     except Exception as e:  # noqa: BLE001
-        sys.stderr.write("[info] Yahoo Brent KO (%s), repli EIA\n" % _safe_err(e))
-        return fetch_eia_series("PET.RBRTE.D")
+        sys.stderr.write("[info] oilpriceapi %s KO (%s)\n" % (code, _safe_err(e)))
+        return None
+
+
+def _freshen_tip(series, code):
+    """Remplace/ajoute le dernier point d'une série EIA par le spot frais oilpriceapi."""
+    tip = fetch_oilprice_latest(code)
+    if not tip:
+        return series
+    day, price = tip
+    series = [(d, v) for (d, v) in series if d < day]
+    series.append((day, price))
+    series.sort(key=lambda t: t[0])
+    return series
+
+
+def fetch_brent():
+    """Brent : historique EIA + tête de série fraîche oilpriceapi (repli : EIA seul)."""
+    if USE_YAHOO_OIL:
+        try:
+            return fetch_yahoo("BZ=F")
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write("[info] Yahoo Brent KO (%s), repli EIA\n" % _safe_err(e))
+    return _freshen_tip(fetch_eia_series("PET.RBRTE.D"), "BRENT_CRUDE_USD")
 
 
 def fetch_wti():
-    """WTI : Yahoo (frais) avec repli EIA."""
-    try:
-        return fetch_yahoo("CL=F")
-    except Exception as e:  # noqa: BLE001
-        sys.stderr.write("[info] Yahoo WTI KO (%s), repli EIA\n" % _safe_err(e))
-        return fetch_eia_series("PET.RWTC.D")
+    """WTI : historique EIA + tête de série fraîche oilpriceapi (repli : EIA seul)."""
+    if USE_YAHOO_OIL:
+        try:
+            return fetch_yahoo("CL=F")
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write("[info] Yahoo WTI KO (%s), repli EIA\n" % _safe_err(e))
+    return _freshen_tip(fetch_eia_series("PET.RWTC.D"), "WTI_USD")
 
 
 def fetch_gie_eu_storage():
@@ -510,9 +611,9 @@ def collect():
 
     # --- Pétrole ---
     brent = attempt("brent", fetch_brent,
-                    unit="$/bbl", direction=1.0, label="Brent")
+                    unit="$/bbl", direction=1.0, label="Brent · spot")
     wti = attempt("wti", fetch_wti,
-                  unit="$/bbl", direction=1.0, label="WTI")
+                  unit="$/bbl", direction=1.0, label="WTI · spot")
     attempt("crude_stocks_us", lambda: fetch_eia_series("PET.WCESTUS1.W"),
             unit="kb", direction=-1.0, label="Stocks brut US (hors SPR)")
     if brent and wti:
@@ -521,7 +622,7 @@ def collect():
 
     # --- Gaz ---
     attempt("henry_hub", lambda: fetch_eia_series("NG.RNGWHHD.D"),
-            unit="$/MMBtu", direction=1.0, label="Henry Hub (spot)")
+            unit="$/MMBtu", direction=1.0, label="Henry Hub · spot EIA")
     attempt("gas_storage_eu", fetch_gie_eu_storage,
             unit="% plein", direction=-1.0, label="Stockage gaz Europe")
 
