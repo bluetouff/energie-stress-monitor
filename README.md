@@ -82,7 +82,7 @@ Toutes primaires, toutes gratuites.
 
 | Indicateur | Source | Clé | Voie |
 |---|---|---|---|
-| Brent, WTI | historique EIA `PET.RBRTE.D`/`PET.RWTC.D` + spot frais oilpriceapi (`BRENT_CRUDE_USD`/`WTI_USD`) | oui | builder |
+| Brent, WTI | historique EIA `PET.RBRTE.D`/`PET.RWTC.D` + tête de série spot temps réel (chaîne oilpriceapi → Twelve Data → Yahoo → EIA) | oui (EIA ; sources spot facultatives) | builder |
 | Stocks bruts US (hors SPR) | EIA `PET.WCESTUS1.W` | oui | builder |
 | Henry Hub (spot) | EIA `NG.RNGWHHD.D` | oui | builder |
 | Stockage gaz Europe (% plein) | GIE AGSI+ `?continent=eu` (champ `full`) | oui (`x-key`) | builder |
@@ -277,12 +277,21 @@ jambes (prix day-ahead FR + DE-LU) et entre pleinement dans le composite.
   démarrage. Déployer en HTTP seul, laisser certbot créer le bloc TLS.
 - **Permission refusée sur `/etc/energie/env`** : vérifier que le **dossier** `/etc/energie`
   est bien `root:energie 750` (sinon le service ne peut pas traverser jusqu'au fichier).
-- **Pétrole figé / laggé** : `OILPRICE_KEY` absente ou quota épuisé → on retombe sur le
-  spot EIA (officiel mais laggé). Vérifier la clé oilpriceapi dans `/etc/energie/env`.
-- **Yahoo renvoie HTTP 429** : rate-limit de l'IP. Le builder retombe automatiquement
-  sur EIA (prix réels mais laggés de quelques jours). Pour la fraîcheur durable, ajouter
-  la gestion cookie+crumb Yahoo. Sources alternatives sans clé : stooq (souvent protégé
-  par un défi anti-bot, peu fiable en script).
+- **Pétrole figé au même prix pendant plusieurs jours** : les deux sources spot temps réel
+  sont tombées. La tête de série suit la chaîne `oilpriceapi → Twelve Data → Yahoo → EIA` ;
+  quand toutes les sources temps réel échouent, le WTI/Brent reste sur le **spot EIA
+  officiel**, qui est valide mais publié avec ~1 semaine de lag (donc figé tant que l'EIA
+  n'a pas publié le point suivant). Ce n'est pas un bug : `tip_source` (dans `snapshot.json`)
+  vaut alors `eia`, et la carte n'est marquée `stale` que si la donnée dépasse
+  `STALE_MAX_AGE_DAYS` (défaut 10 j = l'EIA lui-même est cassé). Causes fréquentes des
+  sources spot : `OILPRICE_KEY` sans crédit (`HTTP 402`), `TWELVEDATA_KEY` sur plan gratuit
+  (le brut exige un plan Grow/Venture, `HTTP 404`), Yahoo qui bannit l'IP serveur (`429`).
+  Diagnostic : `journalctl -u energie-snapshot.service | grep -iE 'oilprice|twelvedata|yahoo|donnee figee'`.
+- **Avoir un prix frais** : aucune source de brut **temps réel gratuite** ne passe depuis un
+  serveur (Yahoo bannit l'IP, Stooq oppose un défi anti-bot, Twelve Data/FMP réservent le
+  brut aux plans payants, CME renvoie 403). Le seul daily gratuit fiable est l'EIA/FRED,
+  laggé de ~1 semaine. Pour du temps réel : recréditer `OILPRICE_KEY`, ou passer un plan
+  payant Twelve Data (le code le prend alors automatiquement).
 - **ENTSO-E HTTP 400 « larger than maximum allowed period 'P1Y' »** : la fenêtre demandée
   dépasse 1 an. Le builder borne à 360 jours (`fetch_entsoe_dayahead(days=360)`).
 - **« réponse trop volumineuse »** : `MAX_BYTES` (24 Mo) trop bas pour un gros XML ENTSO-E.
@@ -323,9 +332,16 @@ cd web && python3 -m http.server 8000
 - Pas de prix **TTF** propre en API gratuite : la tension gaz européenne passe par le
   stockage GIE. Carbone **EUA** non inclus (pas de flux gratuit fiable).
 - **Pétrole** : l'historique (z-score) vient du spot EIA officiel ; la tête de série (prix
-  affiché) est rafraîchie par oilpriceapi.com (temps réel, gratuit). Sans `OILPRICE_KEY`, on
-  reste sur le spot EIA seul (laggé de quelques jours). Chaque carte affiche sa date.
-  Yahoo Finance reste disponible en option (`ENERGIE_YAHOO_OIL=1`) mais rate-limite les IP serveur.
+  affiché) est rafraîchie en temps réel par une chaîne de repli `oilpriceapi → Twelve Data →
+  Yahoo`, sinon on reste sur le spot EIA seul (officiel, laggé de ~1 semaine). Le champ
+  `tip_source` de chaque carte indique la source effective du dernier point, et `age_days`
+  son ancienneté ; le badge `stale` ne s'allume qu'au-delà de `STALE_MAX_AGE_DAYS` (défaut
+  10 j), c.-à-d. quand l'EIA lui-même cesse d'avancer — le lag normal de l'EIA n'est donc
+  pas signalé comme une anomalie. Chaque carte affiche sa date. **Il n'existe pas de source
+  de brut temps réel gratuite exploitable depuis un serveur** (Yahoo bannit l'IP, Stooq/CME
+  opposent des murs anti-bot, Twelve Data/FMP réservent le brut au payant) : pour du frais
+  durable, prévoir un `OILPRICE_KEY` crédité ou un plan payant Twelve Data.
+  Yahoo Finance reste forçable en source primaire (`ENERGIE_YAHOO_OIL=1`) mais rate-limite les IP serveur.
 - `contexte` (EUR/USD) est fetché live côté navigateur, donc absent du composite serveur
   (renormalisé sur les autres sous-indices).
 

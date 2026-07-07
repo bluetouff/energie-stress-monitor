@@ -345,9 +345,12 @@ TWELVEDATA_KEY = os.environ.get("TWELVEDATA_KEY", "").strip()
 TWELVEDATA_WTI = os.environ.get("TWELVEDATA_WTI", "WTI/USD").strip()
 TWELVEDATA_BRENT = os.environ.get("TWELVEDATA_BRENT", "XBR/USD").strip()
 
-# Au-delà de ce nombre de jours sans spot temps réel, une série "spot" pétrole
-# est considérée comme laggée (repli EIA) et marquée stale pour le front.
-SPOT_MAX_AGE_DAYS = int(os.environ.get("ENERGIE_SPOT_MAX_AGE", "3"))
+# Seuil d'ancienneté (jours) au-delà duquel une carte pétrole est marquée stale.
+# Il signale une donnée qui cesse VRAIMENT d'avancer (flux EIA cassé, clé morte),
+# PAS le lag de publication normal de l'EIA (~1 semaine) quand aucune source temps
+# réel n'est branchée : sinon le badge stale serait permanent et ne voudrait plus
+# rien dire. Défaut 10 j = large marge au-dessus du lag habituel de l'EIA (~7 j).
+STALE_MAX_AGE_DAYS = int(os.environ.get("ENERGIE_STALE_MAX_AGE", "10"))
 
 
 def fetch_oilprice_latest(code):
@@ -695,22 +698,22 @@ def collect():
                   unit="$/bbl", direction=1.0, label="WTI · spot")
     attempt("crude_stocks_us", lambda: fetch_eia_series("PET.WCESTUS1.W"),
             unit="kb", direction=-1.0, label="Stocks brut US (hors SPR)")
-    # Signalement explicite : si le spot temps réel n'a pu être appliqué, la
-    # série "spot" tourne en réalité sur l'EIA laggé. On expose la source du
-    # dernier point et on marque stale (repris tel quel par le front) pour que
-    # le lag soit visible plutôt que silencieux.
+    # Transparence + fraîcheur des cartes pétrole. On expose toujours la source
+    # effective du dernier point (tip_source : oilpriceapi/twelvedata/yahoo/eia)
+    # et son ancienneté (age_days), quel que soit l'état. Le badge stale, lui, ne
+    # se déclenche QUE si la donnée cesse réellement d'avancer (age > seuil) :
+    # le repli EIA à son lag normal (~7 j) reste une donnée valide, juste datée,
+    # et ne doit pas crier au loup en permanence.
     for oil in ("brent", "wti"):
         s = series.get(oil)
         if not s or s.get("stale"):
             continue  # déjà en serve-stale (source complètement tombée)
-        src = TIP_SOURCE.get(oil)
-        s["tip_source"] = src
+        s["tip_source"] = TIP_SOURCE.get(oil)
         s["age_days"] = age_days(s.get("date"))
-        lagged = (src == "eia") or (s["age_days"] is not None and s["age_days"] > SPOT_MAX_AGE_DAYS)
-        if lagged:
+        if s["age_days"] is not None and s["age_days"] > STALE_MAX_AGE_DAYS:
             s["stale"] = True
-            notes.append("%s: spot temps reel indisponible, repli EIA lagge (%s j, %s)"
-                         % (oil, s["age_days"], s.get("date")))
+            notes.append("%s: donnee figee, dernier point %s (%s j, > %s j)"
+                         % (oil, s.get("date"), s["age_days"], STALE_MAX_AGE_DAYS))
 
     if brent and wti:
         series["brent_wti_spread"] = derived_spread(
