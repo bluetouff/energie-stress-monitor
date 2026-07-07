@@ -129,6 +129,14 @@ def iso_to_date(s):
         return None
 
 
+def age_days(iso_date):
+    """Ancienneté en jours du point le plus récent d'une série (None si illisible)."""
+    d = iso_to_date(iso_date) if iso_date else None
+    if not d:
+        return None
+    return (datetime.now(timezone.utc).date() - d).days
+
+
 # ---------------------------------------------------------------------------
 # Statistiques : z-score directionnel + momentum -> score de stress 0..100
 # ---------------------------------------------------------------------------
@@ -331,6 +339,10 @@ USE_YAHOO_OIL = os.environ.get("ENERGIE_YAHOO_OIL", "").strip().lower() in ("1",
 
 OILPRICE_KEY = os.environ.get("OILPRICE_KEY", "").strip()
 
+# Au-delà de ce nombre de jours sans spot temps réel, une série "spot" pétrole
+# est considérée comme laggée (repli EIA) et marquée stale pour le front.
+SPOT_MAX_AGE_DAYS = int(os.environ.get("ENERGIE_SPOT_MAX_AGE", "3"))
+
 
 def fetch_oilprice_latest(code):
     """oilpriceapi.com : (date, prix) du dernier spot. None si indisponible.
@@ -355,11 +367,37 @@ def fetch_oilprice_latest(code):
         return None
 
 
-def _freshen_tip(series, code):
-    """Remplace/ajoute le dernier point d'une série EIA par le spot frais oilpriceapi."""
-    tip = fetch_oilprice_latest(code)
+# Source effective du dernier point de chaque série pétrole, renseignée par
+# _freshen_tip / fetch_* et relue dans collect() pour signaler un repli.
+#   "oilpriceapi" | "yahoo" -> spot temps réel ; "eia" -> repli laggé.
+TIP_SOURCE = {}
+
+
+def _yahoo_tip(symbol):
+    """Dernier point Yahoo comme spot frais de repli. None si Yahoo KO/banni."""
+    try:
+        pairs = fetch_yahoo(symbol, rng="5d")
+        return pairs[-1] if pairs else None
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write("[info] Yahoo tip %s KO (%s)\n" % (symbol, _safe_err(e)))
+        return None
+
+
+def _freshen_tip(name, series, code, yahoo_symbol):
+    """Rafraîchit la tête de série EIA avec un spot temps réel.
+    Chaîne : oilpriceapi puis repli Yahoo. Si les deux tombent, on garde l'EIA
+    seul (laggé) et on le signale explicitement (TIP_SOURCE + stderr)."""
+    tip, src = fetch_oilprice_latest(code), "oilpriceapi"
     if not tip:
+        tip, src = _yahoo_tip(yahoo_symbol), "yahoo"
+    if not tip:
+        TIP_SOURCE[name] = "eia"
+        last = series[-1][0].isoformat() if series else "?"
+        sys.stderr.write(
+            "[warn] %s: spot temps reel indisponible (oilpriceapi + Yahoo KO), "
+            "repli EIA seul, dernier point %s\n" % (name, last))
         return series
+    TIP_SOURCE[name] = src
     day, price = tip
     series = [(d, v) for (d, v) in series if d < day]
     series.append((day, price))
@@ -368,23 +406,27 @@ def _freshen_tip(series, code):
 
 
 def fetch_brent():
-    """Brent : historique EIA + tête de série fraîche oilpriceapi (repli : EIA seul)."""
+    """Brent : historique EIA + tête de série spot temps réel (oilpriceapi -> Yahoo)."""
     if USE_YAHOO_OIL:
         try:
-            return fetch_yahoo("BZ=F")
+            pairs = fetch_yahoo("BZ=F")
+            TIP_SOURCE["brent"] = "yahoo"
+            return pairs
         except Exception as e:  # noqa: BLE001
-            sys.stderr.write("[info] Yahoo Brent KO (%s), repli EIA\n" % _safe_err(e))
-    return _freshen_tip(fetch_eia_series("PET.RBRTE.D"), "BRENT_CRUDE_USD")
+            sys.stderr.write("[info] Yahoo Brent KO (%s), repli EIA+oilpriceapi\n" % _safe_err(e))
+    return _freshen_tip("brent", fetch_eia_series("PET.RBRTE.D"), "BRENT_CRUDE_USD", "BZ=F")
 
 
 def fetch_wti():
-    """WTI : historique EIA + tête de série fraîche oilpriceapi (repli : EIA seul)."""
+    """WTI : historique EIA + tête de série spot temps réel (oilpriceapi -> Yahoo)."""
     if USE_YAHOO_OIL:
         try:
-            return fetch_yahoo("CL=F")
+            pairs = fetch_yahoo("CL=F")
+            TIP_SOURCE["wti"] = "yahoo"
+            return pairs
         except Exception as e:  # noqa: BLE001
-            sys.stderr.write("[info] Yahoo WTI KO (%s), repli EIA\n" % _safe_err(e))
-    return _freshen_tip(fetch_eia_series("PET.RWTC.D"), "WTI_USD")
+            sys.stderr.write("[info] Yahoo WTI KO (%s), repli EIA+oilpriceapi\n" % _safe_err(e))
+    return _freshen_tip("wti", fetch_eia_series("PET.RWTC.D"), "WTI_USD", "CL=F")
 
 
 def fetch_gie_eu_storage():
@@ -616,6 +658,23 @@ def collect():
                   unit="$/bbl", direction=1.0, label="WTI · spot")
     attempt("crude_stocks_us", lambda: fetch_eia_series("PET.WCESTUS1.W"),
             unit="kb", direction=-1.0, label="Stocks brut US (hors SPR)")
+    # Signalement explicite : si le spot temps réel n'a pu être appliqué, la
+    # série "spot" tourne en réalité sur l'EIA laggé. On expose la source du
+    # dernier point et on marque stale (repris tel quel par le front) pour que
+    # le lag soit visible plutôt que silencieux.
+    for oil in ("brent", "wti"):
+        s = series.get(oil)
+        if not s or s.get("stale"):
+            continue  # déjà en serve-stale (source complètement tombée)
+        src = TIP_SOURCE.get(oil)
+        s["tip_source"] = src
+        s["age_days"] = age_days(s.get("date"))
+        lagged = (src == "eia") or (s["age_days"] is not None and s["age_days"] > SPOT_MAX_AGE_DAYS)
+        if lagged:
+            s["stale"] = True
+            notes.append("%s: spot temps reel indisponible, repli EIA lagge (%s j, %s)"
+                         % (oil, s["age_days"], s.get("date")))
+
     if brent and wti:
         series["brent_wti_spread"] = derived_spread(
             brent, wti, unit="$/bbl", label="Spread Brent-WTI")
