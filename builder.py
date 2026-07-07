@@ -79,7 +79,7 @@ WEIGHTS = {
 def _safe_err(e):
     """Message d'erreur sans jamais divulguer une clé."""
     s = str(e)
-    for secret in (EIA_KEY, GIE_KEY, ENTSOE_TOKEN):
+    for secret in (EIA_KEY, GIE_KEY, ENTSOE_TOKEN, OILPRICE_KEY, TWELVEDATA_KEY):
         if secret:
             s = s.replace(secret, "***")
     return s
@@ -339,6 +339,12 @@ USE_YAHOO_OIL = os.environ.get("ENERGIE_YAHOO_OIL", "").strip().lower() in ("1",
 
 OILPRICE_KEY = os.environ.get("OILPRICE_KEY", "").strip()
 
+# Twelve Data : source spot de repli (tier gratuit, ~800 req/j, server-friendly).
+# Symboles commodities : WTI/USD (Crude Oil WTI Spot), XBR/USD (Brent Spot).
+TWELVEDATA_KEY = os.environ.get("TWELVEDATA_KEY", "").strip()
+TWELVEDATA_WTI = os.environ.get("TWELVEDATA_WTI", "WTI/USD").strip()
+TWELVEDATA_BRENT = os.environ.get("TWELVEDATA_BRENT", "XBR/USD").strip()
+
 # Au-delà de ce nombre de jours sans spot temps réel, une série "spot" pétrole
 # est considérée comme laggée (repli EIA) et marquée stale pour le front.
 SPOT_MAX_AGE_DAYS = int(os.environ.get("ENERGIE_SPOT_MAX_AGE", "3"))
@@ -373,6 +379,33 @@ def fetch_oilprice_latest(code):
 TIP_SOURCE = {}
 
 
+def fetch_twelvedata_tip(symbol):
+    """Twelve Data /quote : (date, prix) du dernier point spot. None si indisponible.
+    Repli quand oilpriceapi est HS ; server-friendly (contrairement à Yahoo)."""
+    if not TWELVEDATA_KEY or not symbol:
+        return None
+    try:
+        url = ("https://api.twelvedata.com/quote?symbol=%s&apikey=%s"
+               % (urllib.parse.quote(symbol), urllib.parse.quote(TWELVEDATA_KEY)))
+        d = json.loads(http_get(url).decode("utf-8"))
+        if str(d.get("status")) == "error" or d.get("code") not in (None, 200):
+            sys.stderr.write("[info] twelvedata %s KO (%s)\n"
+                             % (symbol, _safe_err(d.get("message") or d)))
+            return None
+        price = fnum(d.get("close") if d.get("close") is not None else d.get("price"))
+        if price is None:
+            return None
+        ts = d.get("timestamp")
+        if ts:
+            day = datetime.fromtimestamp(int(ts), tz=timezone.utc).date()
+        else:
+            day = iso_to_date(d.get("datetime")) or datetime.now(timezone.utc).date()
+        return (day, float(price))
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write("[info] twelvedata %s KO (%s)\n" % (symbol, _safe_err(e)))
+        return None
+
+
 def _yahoo_tip(symbol):
     """Dernier point Yahoo comme spot frais de repli. None si Yahoo KO/banni."""
     try:
@@ -383,19 +416,21 @@ def _yahoo_tip(symbol):
         return None
 
 
-def _freshen_tip(name, series, code, yahoo_symbol):
+def _freshen_tip(name, series, code, td_symbol, yahoo_symbol):
     """Rafraîchit la tête de série EIA avec un spot temps réel.
-    Chaîne : oilpriceapi puis repli Yahoo. Si les deux tombent, on garde l'EIA
-    seul (laggé) et on le signale explicitement (TIP_SOURCE + stderr)."""
+    Chaîne : oilpriceapi -> Twelve Data -> Yahoo. Si toutes tombent, on garde
+    l'EIA seul (laggé) et on le signale explicitement (TIP_SOURCE + stderr)."""
     tip, src = fetch_oilprice_latest(code), "oilpriceapi"
+    if not tip:
+        tip, src = fetch_twelvedata_tip(td_symbol), "twelvedata"
     if not tip:
         tip, src = _yahoo_tip(yahoo_symbol), "yahoo"
     if not tip:
         TIP_SOURCE[name] = "eia"
         last = series[-1][0].isoformat() if series else "?"
         sys.stderr.write(
-            "[warn] %s: spot temps reel indisponible (oilpriceapi + Yahoo KO), "
-            "repli EIA seul, dernier point %s\n" % (name, last))
+            "[warn] %s: spot temps reel indisponible (oilpriceapi + twelvedata + "
+            "Yahoo KO), repli EIA seul, dernier point %s\n" % (name, last))
         return series
     TIP_SOURCE[name] = src
     day, price = tip
@@ -414,7 +449,8 @@ def fetch_brent():
             return pairs
         except Exception as e:  # noqa: BLE001
             sys.stderr.write("[info] Yahoo Brent KO (%s), repli EIA+oilpriceapi\n" % _safe_err(e))
-    return _freshen_tip("brent", fetch_eia_series("PET.RBRTE.D"), "BRENT_CRUDE_USD", "BZ=F")
+    return _freshen_tip("brent", fetch_eia_series("PET.RBRTE.D"),
+                        "BRENT_CRUDE_USD", TWELVEDATA_BRENT, "BZ=F")
 
 
 def fetch_wti():
@@ -426,7 +462,8 @@ def fetch_wti():
             return pairs
         except Exception as e:  # noqa: BLE001
             sys.stderr.write("[info] Yahoo WTI KO (%s), repli EIA+oilpriceapi\n" % _safe_err(e))
-    return _freshen_tip("wti", fetch_eia_series("PET.RWTC.D"), "WTI_USD", "CL=F")
+    return _freshen_tip("wti", fetch_eia_series("PET.RWTC.D"),
+                        "WTI_USD", TWELVEDATA_WTI, "CL=F")
 
 
 def fetch_gie_eu_storage():
