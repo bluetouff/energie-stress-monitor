@@ -281,8 +281,9 @@ jambes (prix day-ahead FR + DE-LU) et entre pleinement dans le composite.
   sont tombées. La tête de série suit la chaîne `oilpriceapi → Twelve Data → Yahoo → EIA` ;
   quand toutes les sources temps réel échouent, le WTI/Brent reste sur le **spot EIA
   officiel**, qui est valide mais publié avec ~1 semaine de lag (donc figé tant que l'EIA
-  n'a pas publié le point suivant). Ce n'est pas un bug : `tip_source` (dans `snapshot.json`)
-  vaut alors `eia`, et la carte n'est marquée `stale` que si la donnée dépasse
+  n'a pas publié le point suivant). Ce n'est pas un bug : `tip_source` vaut alors `eia`,
+  `quality_status` vaut `official-delayed`, `source_warning` et `notes` exposent la date
+  effective dans `snapshot.json`, et la carte n'est marquée `stale` que si la donnée dépasse
   `STALE_MAX_AGE_DAYS` (défaut 10 j = l'EIA lui-même est cassé). Causes fréquentes des
   sources spot : `OILPRICE_KEY` sans crédit (`HTTP 402`), `TWELVEDATA_KEY` sur plan gratuit
   (le brut exige un plan Grow/Venture, `HTTP 404`), Yahoo qui bannit l'IP serveur (`429`).

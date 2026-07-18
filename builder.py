@@ -667,6 +667,35 @@ def load_previous():
         return {}
 
 
+def annotate_oil_provenance(series, notes):
+    """Expose la source et le retard du dernier point Brent/WTI.
+
+    Le seuil ``stale`` reste réservé à une vraie rupture EIA. Le repli EIA
+    normal est néanmoins visible comme qualité différée dans le snapshot.
+    """
+    for oil in ("brent", "wti"):
+        s = series.get(oil)
+        if not s or s.get("stale"):
+            continue  # déjà en serve-stale (source complètement tombée)
+        s["tip_source"] = TIP_SOURCE.get(oil)
+        s["age_days"] = age_days(s.get("date"))
+        if s["tip_source"] == "eia":
+            s["quality_status"] = "official-delayed"
+            warning = (
+                "%s: source EIA quotidienne officielle différée, dernier point %s (%s j)"
+                % (oil, s.get("date"), s.get("age_days"))
+            )
+            s["source_warning"] = warning
+            notes.append(warning)
+        else:
+            s["quality_status"] = "nominal"
+            s["source_warning"] = None
+        if s["age_days"] is not None and s["age_days"] > STALE_MAX_AGE_DAYS:
+            s["stale"] = True
+            notes.append("%s: donnee figee, dernier point %s (%s j, > %s j)"
+                         % (oil, s.get("date"), s["age_days"], STALE_MAX_AGE_DAYS))
+
+
 def collect():
     prev = load_previous()
     prev_series = prev.get("series", {})
@@ -702,18 +731,9 @@ def collect():
     # effective du dernier point (tip_source : oilpriceapi/twelvedata/yahoo/eia)
     # et son ancienneté (age_days), quel que soit l'état. Le badge stale, lui, ne
     # se déclenche QUE si la donnée cesse réellement d'avancer (age > seuil) :
-    # le repli EIA à son lag normal (~7 j) reste une donnée valide, juste datée,
-    # et ne doit pas crier au loup en permanence.
-    for oil in ("brent", "wti"):
-        s = series.get(oil)
-        if not s or s.get("stale"):
-            continue  # déjà en serve-stale (source complètement tombée)
-        s["tip_source"] = TIP_SOURCE.get(oil)
-        s["age_days"] = age_days(s.get("date"))
-        if s["age_days"] is not None and s["age_days"] > STALE_MAX_AGE_DAYS:
-            s["stale"] = True
-            notes.append("%s: donnee figee, dernier point %s (%s j, > %s j)"
-                         % (oil, s.get("date"), s["age_days"], STALE_MAX_AGE_DAYS))
+    # le repli EIA à son lag normal (~7 j) reste une donnée valide et datée,
+    # signalée comme official-delayed sans être assimilée à une rupture.
+    annotate_oil_provenance(series, notes)
 
     if brent and wti:
         series["brent_wti_spread"] = derived_spread(
