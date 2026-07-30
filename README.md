@@ -71,8 +71,10 @@ données).
 
 Le builder n'a **aucune dépendance externe** (bibliothèque standard Python uniquement),
 ce qui élimine tout risque de chaîne d'approvisionnement. Il dégrade gracieusement : si
-une source tombe, la dernière valeur connue est conservée (marquée `stale`) et n'entre
-plus dans le calcul du score ; le build ne plante jamais sur une source en échec.
+une source tombe, la dernière valeur connue est conservée. Elle reste dans le calcul avec
+le statut `cached-current` tant que sa date respecte la cadence normale de publication de
+la source ; elle passe ensuite `stale` et sort du score. Le build ne plante jamais sur une
+source en échec.
 
 ---
 
@@ -200,8 +202,9 @@ sudo runuser -u energie -- bash -c 'set -a; . /etc/energie/env; set +a; exec /op
 ```
 
 Attendu : `[ok] snapshot écrit ... composite=NN`. Les `[warn]` listent les sources
-momentanément indisponibles (serve-stale automatique ; `elec_fr`/`elec_de` si pas de token
-ENTSO-E, c'est normal).
+momentanément indisponibles. Un point déjà publié reste `cached-current` dans sa fenêtre
+normale de fraîcheur, puis passe automatiquement `stale` ; `elec_fr`/`elec_de` sans token
+ENTSO-E sont donc absents au premier build, ce qui est normal.
 
 ### 4. systemd
 
