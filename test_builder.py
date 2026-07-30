@@ -28,5 +28,45 @@ class OilProvenanceTest(unittest.TestCase):
             builder.TIP_SOURCE.update(previous_tip_source)
 
 
+class CachedFallbackTest(unittest.TestCase):
+    def test_current_cached_value_remains_eligible(self):
+        today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+        fallback = builder.cached_fallback(
+            {"date": today, "score": 74.0, "stale": False},
+            "elec_fr indisponible: timeout",
+            max_age_days=1,
+        )
+
+        self.assertFalse(fallback["stale"])
+        self.assertEqual(fallback["quality_status"], "cached-current")
+        self.assertEqual(fallback["age_days"], 0)
+        composite, subindices = builder.composite({
+            "elec_fr": fallback,
+            "elec_de": {"score": 80.0, "stale": False},
+        })
+        self.assertEqual(subindices["electricite"]["score"], 77.0)
+        self.assertEqual(composite["score"], 77.0)
+
+    def test_expired_cached_value_is_excluded(self):
+        old = (
+            datetime.datetime.now(datetime.timezone.utc).date()
+            - datetime.timedelta(days=3)
+        ).isoformat()
+        fallback = builder.cached_fallback(
+            {"date": old, "score": 74.0, "stale": False},
+            "elec_fr indisponible: timeout",
+            max_age_days=1,
+        )
+
+        self.assertTrue(fallback["stale"])
+        self.assertEqual(fallback["quality_status"], "stale")
+        composite, subindices = builder.composite({
+            "elec_fr": fallback,
+            "elec_de": {"score": 80.0, "stale": False},
+        })
+        self.assertEqual(subindices["electricite"]["score"], 80.0)
+        self.assertEqual(composite["score"], 80.0)
+
+
 if __name__ == "__main__":
     unittest.main()

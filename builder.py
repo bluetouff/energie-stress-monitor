@@ -18,8 +18,9 @@ Sources (toutes vérifiées) :
   - ODRE  éCO2mix        : mix France + intensité CO2                 (sans clé)
 
 Robustesse : chaque source est isolée dans un try/except. Si une source tombe,
-on conserve la valeur du snapshot précédent (serve-stale) et on marque la série
-"stale". Le build ne plante jamais sur une seule source en échec.
+on conserve la valeur du snapshot précédent. Elle reste exploitable tant que sa
+date respecte la cadence normale de publication, puis passe "stale". Le build
+ne plante jamais sur une seule source en échec.
 """
 
 import os
@@ -352,6 +353,21 @@ TWELVEDATA_BRENT = os.environ.get("TWELVEDATA_BRENT", "XBR/USD").strip()
 # rien dire. Défaut 10 j = large marge au-dessus du lag habituel de l'EIA (~7 j).
 STALE_MAX_AGE_DAYS = int(os.environ.get("ENERGIE_STALE_MAX_AGE", "10"))
 
+# Ancienneté maximale d'un point déjà publié pour qu'un échec de collecte
+# ponctuel ne l'exclue pas à tort du composite. Ces seuils suivent la cadence
+# normale de chaque source, pas la fréquence du timer (30 min).
+FALLBACK_MAX_AGE_DAYS = {
+    "crude_stocks_us": 10,   # EIA hebdomadaire
+    "henry_hub": 7,          # EIA quotidienne, avec week-ends et délai de publication
+    "gas_storage_eu": 2,     # GIE quotidienne, deux publications le soir
+    "elec_fr": 1,            # ENTSO-E day-ahead
+    "elec_de": 1,
+    "fossil_share_fr": 1,    # ODRE quasi temps réel
+    "co2_fr": 1,
+    "cftc_wti_net": 12,      # données du mardi publiées le vendredi
+    "cftc_natgas_net": 12,
+}
+
 
 def fetch_oilprice_latest(code):
     """oilpriceapi.com : (date, prix) du dernier spot. None si indisponible.
@@ -667,6 +683,27 @@ def load_previous():
         return {}
 
 
+def cached_fallback(previous, source_error, max_age_days=None):
+    """Qualifie un point conservé après un échec ponctuel de collecte.
+
+    Une valeur encore dans la fenêtre normale de publication reste exploitable
+    dans le composite et est signalée ``cached-current``. Elle ne devient
+    ``stale`` qu'une fois cette fenêtre dépassée.
+    """
+    cached = dict(previous)
+    cached_age = age_days(cached.get("date"))
+    still_current = (
+        max_age_days is not None
+        and cached_age is not None
+        and cached_age <= max_age_days
+    )
+    cached["stale"] = not still_current
+    cached["age_days"] = cached_age
+    cached["quality_status"] = "cached-current" if still_current else "stale"
+    cached["source_warning"] = source_error
+    return cached
+
+
 def annotate_oil_provenance(series, notes):
     """Expose la source et le retard du dernier point Brent/WTI.
 
@@ -703,7 +740,7 @@ def collect():
     notes = []
 
     def attempt(name, fn, **build_kwargs):
-        """Tente une collecte; sinon réutilise la valeur précédente (serve-stale)."""
+        """Tente une collecte; sinon qualifie puis réutilise le point précédent."""
         try:
             pairs = fn()
             if not pairs:
@@ -712,12 +749,26 @@ def collect():
             return pairs
         except Exception as e:  # noqa: BLE001 — on isole chaque source
             msg = "%s indisponible: %s" % (name, _safe_err(e))
+            if name in prev_series:
+                fallback = cached_fallback(
+                    prev_series[name],
+                    msg,
+                    FALLBACK_MAX_AGE_DAYS.get(name),
+                )
+                series[name] = fallback
+                if not fallback["stale"]:
+                    msg += (
+                        "; dernier point %s réutilisé comme encore courant "
+                        "(%s j, seuil %s j)"
+                        % (
+                            fallback.get("date"),
+                            fallback.get("age_days"),
+                            FALLBACK_MAX_AGE_DAYS[name],
+                        )
+                    )
+                    fallback["source_warning"] = msg
             notes.append(msg)
             sys.stderr.write("[warn] " + msg + "\n")
-            if name in prev_series:
-                stale = dict(prev_series[name])
-                stale["stale"] = True
-                series[name] = stale
             return None
 
     # --- Pétrole ---
@@ -778,7 +829,23 @@ def collect():
         sys.stderr.write("[warn] " + msg + "\n")
         for k in ("fossil_share_fr", "co2_fr"):
             if k in prev_series:
-                s = dict(prev_series[k]); s["stale"] = True; series[k] = s
+                fallback = cached_fallback(
+                    prev_series[k],
+                    msg,
+                    FALLBACK_MAX_AGE_DAYS[k],
+                )
+                series[k] = fallback
+                if not fallback["stale"]:
+                    fallback["source_warning"] = (
+                        "%s; dernier point %s réutilisé comme encore courant "
+                        "(%s j, seuil %s j)"
+                        % (
+                            msg,
+                            fallback.get("date"),
+                            fallback.get("age_days"),
+                            FALLBACK_MAX_AGE_DAYS[k],
+                        )
+                    )
 
     # --- Positionnement (CFTC) ---
     attempt("cftc_wti_net", lambda: fetch_cftc_net(CFTC_WTI),
