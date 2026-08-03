@@ -19,3 +19,4 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m unittest -v test_builder.py
+      - run: bash -n deploy/activate-release.sh

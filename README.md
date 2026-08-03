@@ -57,7 +57,7 @@ données).
   +-------------------------------------------+
   |  timer systemd (toutes les 30 min)        |
   |     -> builder.py  (venv, stdlib only)    |
-  |          EIA, GIE, ENTSO-E (avec clés)    |
+  |          EIA (cache 4 h), GIE, ENTSO-E    |
   |          CFTC, ODRE (sans clé)            |
   |          calcule z-scores + composite     |
   |     -> /var/www/html/energie/snapshot.json|
@@ -84,7 +84,7 @@ Toutes primaires, toutes gratuites.
 
 | Indicateur | Source | Clé | Voie |
 |---|---|---|---|
-| Brent, WTI | historique EIA `PET.RBRTE.D`/`PET.RWTC.D` + tête de série spot temps réel (chaîne oilpriceapi → Twelve Data → Yahoo → EIA) | oui (EIA ; sources spot facultatives) | builder |
+| Brent, WTI | EIA Petroleum `RBRTE` / `RWTC`, spot quotidien en $/bbl | oui | builder |
 | Stocks bruts US (hors SPR) | EIA `PET.WCESTUS1.W` | oui | builder |
 | Henry Hub (spot) | EIA `NG.RNGWHHD.D` | oui | builder |
 | Stockage gaz Europe (% plein) | GIE AGSI+ `?continent=eu` (champ `full`) | oui (`x-key`) | builder |
@@ -130,11 +130,11 @@ vide est versionné.
 donc aucun risque de chaîne d'approvisionnement). Il tourne sous un utilisateur système
 dédié sans shell ni home, dans un bac à sable systemd durci : `NoNewPrivileges`,
 `ProtectSystem=strict`, `SystemCallFilter=@system-service`, `MemoryDenyWriteExecute`,
-`CapabilityBoundingSet=` (vide), `RestrictAddressFamilies` limité, et un seul chemin
-accessible en écriture (`ReadWritePaths=/var/www/html/energie`).
+`CapabilityBoundingSet=` (vide) et `RestrictAddressFamilies` limité. Seuls le snapshot et
+le cache EIA public géré par `CacheDirectory=energie` sont accessibles en écriture.
 
 **Réseau.** `http_get` refuse toute URL non-HTTPS et toute redirection qui quitterait HTTPS
-(anti-downgrade), et borne la lecture à 8 Mo par requête (anti-DoS mémoire).
+(anti-downgrade), et borne la lecture à 24 Mo par requête (anti-DoS mémoire).
 
 **Navigateur.** CSP stricte servie par Apache : `default-src 'none'`, `script-src 'self'`,
 `style-src 'self'` (aucun inline, ni JS ni CSS), `connect-src` limité aux deux seuls flux
@@ -143,7 +143,8 @@ live légitimes. Plus `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`
 zéro traceur.
 
 **Intégrité.** Écriture atomique du snapshot (`os.replace`) : le fichier servi n'est jamais
-partiellement écrit. Les messages d'erreur masquent les clés (`_safe_err`).
+partiellement écrit. Le cache EIA est également atomique, validé avant réutilisation et ne
+stocke ni URL ni clé. Les messages d'erreur masquent les clés (`_safe_err`).
 
 ---
 
@@ -206,6 +207,11 @@ momentanément indisponibles. Un point déjà publié reste `cached-current` dan
 normale de fraîcheur, puis passe automatiquement `stale` ; `elec_fr`/`elec_de` sans token
 ENTSO-E sont donc absents au premier build, ce qui est normal.
 
+Le timer continue de calculer toutes les 30 minutes, mais chaque série EIA n'effectue au
+maximum qu'un contrôle réseau toutes les quatre heures. Les exécutions intermédiaires
+lisent un petit cache JSON local. Il n'y a ni boucle de retry, ni appel direct depuis les
+visiteurs, ni clé dans le cache.
+
 ### 4. systemd
 
 ```bash
@@ -242,6 +248,16 @@ Puis ajouter HSTS au vhost SSL généré (`energie.l0g.fr-le-ssl.conf`) :
 ```apache
 Header always set Strict-Transport-Security "max-age=31536000; includeSubDomains"
 ```
+
+### Mise à jour d'une release existante
+
+`deploy/activate-release.sh` est destiné au serveur Zen. Il reçoit une archive Git de la
+révision fusionnée, son SHA-256 et le SHA Git complet. Avant installation, il contrôle le
+préfixe et l'empreinte de l'archive, compile le builder, exécute les tests et valide les
+unités systemd. Il sauvegarde ensuite le builder et les unités actifs dans
+`/var/backups/energie-*`, sans modifier `/etc/energie/env`. Un échec après activation
+restaure automatiquement la version précédente. La réussite exige enfin un service sans
+erreur, un timer actif et un snapshot contenant les contrats EIA Brent/WTI attendus.
 
 ### 6. Vérification finale
 
@@ -280,22 +296,17 @@ jambes (prix day-ahead FR + DE-LU) et entre pleinement dans le composite.
   démarrage. Déployer en HTTP seul, laisser certbot créer le bloc TLS.
 - **Permission refusée sur `/etc/energie/env`** : vérifier que le **dossier** `/etc/energie`
   est bien `root:energie 750` (sinon le service ne peut pas traverser jusqu'au fichier).
-- **Pétrole figé au même prix pendant plusieurs jours** : les deux sources spot temps réel
-  sont tombées. La tête de série suit la chaîne `oilpriceapi → Twelve Data → Yahoo → EIA` ;
-  quand toutes les sources temps réel échouent, le WTI/Brent reste sur le **spot EIA
-  officiel**, qui est valide mais publié avec ~1 semaine de lag (donc figé tant que l'EIA
-  n'a pas publié le point suivant). Ce n'est pas un bug : `tip_source` vaut alors `eia`,
-  `quality_status` vaut `official-delayed`, `source_warning` et `notes` exposent la date
-  effective dans `snapshot.json`, et la carte n'est marquée `stale` que si la donnée dépasse
-  `STALE_MAX_AGE_DAYS` (défaut 10 j = l'EIA lui-même est cassé). Causes fréquentes des
-  sources spot : `OILPRICE_KEY` sans crédit (`HTTP 402`), `TWELVEDATA_KEY` sur plan gratuit
-  (le brut exige un plan Grow/Venture, `HTTP 404`), Yahoo qui bannit l'IP serveur (`429`).
-  Diagnostic : `journalctl -u energie-snapshot.service | grep -iE 'oilprice|twelvedata|yahoo|donnee figee'`.
-- **Avoir un prix frais** : aucune source de brut **temps réel gratuite** ne passe depuis un
-  serveur (Yahoo bannit l'IP, Stooq oppose un défi anti-bot, Twelve Data/FMP réservent le
-  brut aux plans payants, CME renvoie 403). Le seul daily gratuit fiable est l'EIA/FRED,
-  laggé de ~1 semaine. Pour du temps réel : recréditer `OILPRICE_KEY`, ou passer un plan
-  payant Twelve Data (le code le prend alors automatiquement).
+- **Pétrole inchangé pendant plusieurs jours** : le WTI et le Brent viennent exclusivement
+  du spot quotidien officiel EIA. Une fréquence `daily` décrit la granularité des points,
+  pas une promesse de publication chaque jour calendaire. Le snapshot expose `tip_source`,
+  `source_series`, `source_checked_at`, `source_refresh_mode` et `age_days`. Après trois
+  jours, `quality_status=official-delayed` rend le retard visible ; après dix jours par
+  défaut, le point devient `stale` et sort du score. Diagnostic :
+  `journalctl -u energie-snapshot.service | grep -iE 'EIA|donnee figee'`.
+- **Contrôler la charge EIA** : `ENERGIE_EIA_MIN_REFRESH_SECONDS=14400` plafonne chaque
+  série à six contrôles réseau par jour. Garder ce réglage en production. Une erreur ne
+  déclenche aucun retry dans le même cycle ; le snapshot précédent prend le relais avec
+  son statut de qualité explicite.
 - **ENTSO-E HTTP 400 « larger than maximum allowed period 'P1Y' »** : la fenêtre demandée
   dépasse 1 an. Le builder borne à 360 jours (`fetch_entsoe_dayahead(days=360)`).
 - **« réponse trop volumineuse »** : `MAX_BYTES` (24 Mo) trop bas pour un gros XML ENTSO-E.
@@ -315,6 +326,7 @@ energie-stress-monitor/
 ├── deploy/
 │   ├── energie-snapshot.service
 │   ├── energie-snapshot.timer
+│   ├── activate-release.sh       # activation sauvegardée avec rollback
 │   └── energie.l0g.fr.conf
 └── web/
     ├── index.html
@@ -335,17 +347,11 @@ cd web && python3 -m http.server 8000
 
 - Pas de prix **TTF** propre en API gratuite : la tension gaz européenne passe par le
   stockage GIE. Carbone **EUA** non inclus (pas de flux gratuit fiable).
-- **Pétrole** : l'historique (z-score) vient du spot EIA officiel ; la tête de série (prix
-  affiché) est rafraîchie en temps réel par une chaîne de repli `oilpriceapi → Twelve Data →
-  Yahoo`, sinon on reste sur le spot EIA seul (officiel, laggé de ~1 semaine). Le champ
-  `tip_source` de chaque carte indique la source effective du dernier point, et `age_days`
-  son ancienneté ; le badge `stale` ne s'allume qu'au-delà de `STALE_MAX_AGE_DAYS` (défaut
-  10 j), c.-à-d. quand l'EIA lui-même cesse d'avancer — le lag normal de l'EIA n'est donc
-  pas signalé comme une anomalie. Chaque carte affiche sa date. **Il n'existe pas de source
-  de brut temps réel gratuite exploitable depuis un serveur** (Yahoo bannit l'IP, Stooq/CME
-  opposent des murs anti-bot, Twelve Data/FMP réservent le brut au payant) : pour du frais
-  durable, prévoir un `OILPRICE_KEY` crédité ou un plan payant Twelve Data.
-  Yahoo Finance reste forçable en source primaire (`ENERGIE_YAHOO_OIL=1`) mais rate-limite les IP serveur.
+- **Pétrole** : historique et dernier point viennent du spot quotidien EIA officiel. Ce
+  choix privilégie la provenance, la stabilité et l'absence de blocage ; ce n'est pas du
+  quasi temps réel. Chaque carte publie sa série, la date du point et la date du dernier
+  contrôle. Une donnée encore compatible avec la cadence EIA reste exploitable et
+  signalée `official-delayed`; une vraie rupture passe `stale` et sort du composite.
 - `contexte` (EUR/USD) est fetché live côté navigateur, donc absent du composite serveur
   (renormalisé sur les autres sous-indices).
 

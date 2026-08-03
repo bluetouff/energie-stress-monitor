@@ -10,6 +10,7 @@ Group=energie
 # UMask 027 + setgid sur le dossier web => snapshot écrit en rw-r----- energie:www-data
 # (Apache le lit via le groupe, jamais world-readable, sans chmod manuel)
 UMask=027
+Environment=ENERGIE_EIA_CACHE_DIR=/var/cache/energie/eia
 EnvironmentFile=/etc/energie/env
 ExecStart=/opt/energie/venv/bin/python3 /opt/energie/builder.py
 TimeoutStartSec=180
@@ -34,9 +35,12 @@ MemoryDenyWriteExecute=true
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 CapabilityBoundingSet=
+CacheDirectory=energie
+CacheDirectoryMode=0750
 # AF_UNIX requis pour la résolution DNS via systemd-resolved (nss-resolve)
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-# accès en lecture au dossier web (groupe www-data) pour écrire le snapshot
+# Le snapshot est le seul autre chemin en écriture; CacheDirectory ouvre
+# strictement /var/cache/energie au service pour les réponses publiques EIA.
 SupplementaryGroups=www-data
 ReadWritePaths=/var/www/html/energie
 

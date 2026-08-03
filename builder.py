@@ -11,7 +11,8 @@ l'indice composite) se fait ici, côté serveur, lancé par un timer systemd.
 Le front ne lit que du JSON pré-calculé + deux flux live sans clé.
 
 Sources (toutes vérifiées) :
-  - EIA  v2 /seriesid/   : Brent, WTI, Henry Hub, stocks brut US      (clé EIA_KEY)
+  - EIA  v2 petroleum    : Brent et WTI spot quotidiens              (clé EIA_KEY)
+  - EIA  v2 /seriesid/   : Henry Hub et stocks brut US               (clé EIA_KEY)
   - GIE  AGSI+           : stockage gaz Europe (% full)               (clé GIE_KEY, header x-key)
   - ENTSO-E              : prix day-ahead FR + DE-LU (A44)            (token ENTSOE_TOKEN)
   - CFTC  Socrata legacy : positionnement non-commercial WTI/NatGas  (sans clé)
@@ -27,12 +28,11 @@ import os
 import sys
 import json
 import math
-import time
 import statistics
-import http.cookiejar
 import urllib.request
 import urllib.parse
 import urllib.error
+import tempfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta, date
 
@@ -49,6 +49,14 @@ USER_AGENT = "l0g-energie-monitor/1.0 (+https://l0g.fr)"
 EIA_KEY = os.environ.get("EIA_KEY", "").strip()
 GIE_KEY = os.environ.get("GIE_KEY", "").strip()
 ENTSOE_TOKEN = os.environ.get("ENTSOE_TOKEN", "").strip()
+
+# Le timer général reste à 30 min pour les sources intrajournalières, mais
+# l'EIA n'est jamais interrogée plus souvent que cette fenêtre. Les réponses
+# publiques validées sont mises en cache côté serveur, sans aucune clé.
+EIA_MIN_REFRESH_SECONDS = int(os.environ.get("ENERGIE_EIA_MIN_REFRESH_SECONDS", "14400"))
+EIA_CACHE_DIR = os.environ.get(
+    "ENERGIE_EIA_CACHE_DIR", os.path.join(HERE, ".cache", "eia"))
+EIA_FETCH_META = {}
 
 # Fenêtre d'historique pour les z-scores (jours calendaires)
 HIST_DAYS = 365 * 3            # on tire ~3 ans
@@ -80,7 +88,7 @@ WEIGHTS = {
 def _safe_err(e):
     """Message d'erreur sans jamais divulguer une clé."""
     s = str(e)
-    for secret in (EIA_KEY, GIE_KEY, ENTSOE_TOKEN, OILPRICE_KEY, TWELVEDATA_KEY):
+    for secret in (EIA_KEY, GIE_KEY, ENTSOE_TOKEN):
         if secret:
             s = s.replace(secret, "***")
     return s
@@ -224,8 +232,108 @@ def drop_outliers(pairs, k=6.0):
 # Collecteurs (un par source). Chacun renvoie une liste (date, valeur) ancien->récent
 # ---------------------------------------------------------------------------
 
-def fetch_eia_series(series_id, length=900):
-    """EIA v2 via /seriesid/ (compat APIv1). Renvoie [(date, value), ...] ancien->récent."""
+EIA_CACHE_SCHEMA = "l0g-energie/eia-cache/v1"
+
+
+def _eia_cache_path(series_id):
+    """Chemin de cache déterministe, limité aux identifiants EIA attendus."""
+    if not series_id or any(
+            char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+            for char in series_id):
+        raise ValueError("identifiant de série EIA invalide")
+    return os.path.join(EIA_CACHE_DIR, series_id + ".json")
+
+
+def _read_eia_cache(series_id):
+    """Lit et valide un cache public EIA; ignore tout fichier incomplet ou altéré."""
+    try:
+        with open(_eia_cache_path(series_id), "r", encoding="utf-8") as handle:
+            cached = json.load(handle)
+        if cached.get("schema") != EIA_CACHE_SCHEMA or cached.get("series") != series_id:
+            return None
+        checked_at = datetime.fromisoformat(
+            str(cached.get("checked_at", "")).replace("Z", "+00:00"))
+        if checked_at.tzinfo is None:
+            return None
+        pairs = []
+        for item in cached.get("pairs") or []:
+            if not isinstance(item, list) or len(item) != 2:
+                return None
+            day = iso_to_date(item[0])
+            value = fnum(item[1])
+            if not day or value is None or not math.isfinite(value):
+                return None
+            pairs.append((day, value))
+        if not pairs:
+            return None
+        pairs.sort(key=lambda item: item[0])
+        return checked_at.astimezone(timezone.utc), pairs
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _write_eia_cache(series_id, pairs, checked_at):
+    """Écrit atomiquement des données publiques EIA, sans URL ni clé API."""
+    os.makedirs(EIA_CACHE_DIR, mode=0o750, exist_ok=True)
+    payload = {
+        "schema": EIA_CACHE_SCHEMA,
+        "series": series_id,
+        "checked_at": checked_at.isoformat().replace("+00:00", "Z"),
+        "pairs": [[day.isoformat(), value] for day, value in pairs],
+    }
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=EIA_CACHE_DIR,
+                prefix=".eia-", suffix=".tmp", delete=False) as handle:
+            temporary = handle.name
+            json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, _eia_cache_path(series_id))
+    except Exception:
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+        raise
+
+
+def _fetch_eia_cached(series_id, fetch_uncached):
+    """Plafonne les appels EIA et conserve la date du dernier contrôle réseau."""
+    cached = _read_eia_cache(series_id)
+    now = datetime.now(timezone.utc)
+    if cached:
+        checked_at, pairs = cached
+        cache_age = (now - checked_at).total_seconds()
+        if EIA_MIN_REFRESH_SECONDS > 0 and 0 <= cache_age < EIA_MIN_REFRESH_SECONDS:
+            EIA_FETCH_META[series_id] = {
+                "checked_at": checked_at.isoformat().replace("+00:00", "Z"),
+                "refresh_mode": "cache",
+            }
+            return pairs
+
+    pairs = fetch_uncached()
+    if not pairs:
+        raise RuntimeError("réponse EIA vide pour %s" % series_id)
+    checked_at = datetime.now(timezone.utc)
+    EIA_FETCH_META[series_id] = {
+        "checked_at": checked_at.isoformat().replace("+00:00", "Z"),
+        "refresh_mode": "network",
+    }
+    try:
+        _write_eia_cache(series_id, pairs, checked_at)
+    except OSError as error:
+        sys.stderr.write("[warn] cache EIA %s non écrit: %s\n"
+                         % (series_id, _safe_err(error)))
+    return pairs
+
+
+def _fetch_eia_series_uncached(series_id, length=900):
+    """Appel EIA /seriesid/ sans cache, réservé au wrapper plafonné."""
     if not EIA_KEY:
         raise RuntimeError("EIA_KEY absente")
     qs = urllib.parse.urlencode({
@@ -247,116 +355,29 @@ def fetch_eia_series(series_id, length=900):
     return drop_outliers(out)
 
 
-_YAHOO_UA = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
-_YAHOO_HEADERS = {
-    "User-Agent": _YAHOO_UA,
-    "Accept": "application/json,text/plain,*/*",
-    "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
-    "Referer": "https://finance.yahoo.com/",
-    "Connection": "keep-alive",
-}
-_YAHOO_CJ = http.cookiejar.CookieJar()
-_YAHOO_OPENER = urllib.request.build_opener(
-    _HTTPSRedirectOnly(), urllib.request.HTTPCookieProcessor(_YAHOO_CJ))
-_yahoo_primed = False
+def fetch_eia_series(series_id, length=900):
+    """EIA v2 /seriesid/, avec au plus un contrôle réseau par fenêtre de cache."""
+    return _fetch_eia_cached(
+        series_id,
+        lambda: _fetch_eia_series_uncached(series_id, length=length),
+    )
 
-
-def _yahoo_prime():
-    """Récupère un cookie de session Yahoo (réduit fortement les 429)."""
-    global _yahoo_primed
-    if _yahoo_primed:
-        return
-    for u in ("https://fc.yahoo.com/", "https://finance.yahoo.com/quote/CL=F"):
-        try:
-            _YAHOO_OPENER.open(
-                urllib.request.Request(u, headers=_YAHOO_HEADERS),
-                timeout=HTTP_TIMEOUT).read(4096)
-            break
-        except Exception:  # noqa: BLE001 — un 404 dépose souvent le cookie quand même
-            continue
-    _yahoo_primed = True
-
-
-def _yahoo_get(symbol, rng):
-    """GET chart Yahoo avec cookie, bascule query1/query2 et retry sur 429."""
-    _yahoo_prime()
-    last = None
-    for host in ("query1", "query2"):
-        url = ("https://%s.finance.yahoo.com/v8/finance/chart/%s?interval=1d&range=%s"
-               % (host, urllib.parse.quote(symbol, safe="=^"), rng))
-        for attempt in range(3):
-            try:
-                req = urllib.request.Request(url, headers=_YAHOO_HEADERS)
-                with _YAHOO_OPENER.open(req, timeout=HTTP_TIMEOUT) as r:
-                    raw = r.read(MAX_BYTES + 1)
-                if len(raw) > MAX_BYTES:
-                    raise urllib.error.URLError("réponse trop volumineuse")
-                return json.loads(raw.decode("utf-8"))
-            except urllib.error.HTTPError as e:
-                last = e
-                if e.code == 429:
-                    time.sleep(1.5 * (attempt + 1))  # backoff puis retry
-                    continue
-                break  # autre code : on tente l'autre host
-            except Exception as e:  # noqa: BLE001
-                last = e
-                break
-    raise last or RuntimeError("Yahoo indisponible")
-
-
-def fetch_yahoo(symbol, rng="2y"):
-    """Yahoo Finance chart : [(date, close)] ancien->récent, dernier point = prix
-    temps réel (meta.regularMarketPrice). Robuste : cookie + query1/2 + retry 429."""
-    data = _yahoo_get(symbol, rng)
-    res = data.get("chart", {}).get("result")
-    if not res:
-        raise RuntimeError("réponse Yahoo vide")
-    r = res[0]
-    ts = r.get("timestamp") or []
-    quote = (r.get("indicators", {}).get("quote") or [{}])[0]
-    closes = quote.get("close") or []
-    out = []
-    for t, c in zip(ts, closes):
-        if c is None:
-            continue
-        out.append((datetime.fromtimestamp(t, tz=timezone.utc).date(), float(c)))
-    # dernier point : prix temps réel (remplace la barre du jour si présente)
-    meta = r.get("meta", {})
-    rmp, rmt = meta.get("regularMarketPrice"), meta.get("regularMarketTime")
-    if rmp is not None and rmt:
-        d = datetime.fromtimestamp(rmt, tz=timezone.utc).date()
-        out = [(dd, vv) for dd, vv in out if dd != d]
-        out.append((d, float(rmp)))
-    out.sort(key=lambda t: t[0])
-    if not out:
-        raise RuntimeError("aucune cotation Yahoo exploitable")
-    return drop_outliers(out)
-
-
-# Yahoo désactivé par défaut : l'API rate-limite (429) les IP de serveur.
-# Mettre ENERGIE_YAHOO_OIL=1 dans l'env pour tenter Yahoo (frais) si l'IP n'est
-# pas bannie ; sinon on reste sur le spot EIA officiel (fiable, laggé de quelques jours).
-USE_YAHOO_OIL = os.environ.get("ENERGIE_YAHOO_OIL", "").strip().lower() in ("1", "true", "yes")
-
-OILPRICE_KEY = os.environ.get("OILPRICE_KEY", "").strip()
-
-# Twelve Data : source spot de repli (tier gratuit, ~800 req/j, server-friendly).
-# Symboles commodities : WTI/USD (Crude Oil WTI Spot), XBR/USD (Brent Spot).
-TWELVEDATA_KEY = os.environ.get("TWELVEDATA_KEY", "").strip()
-TWELVEDATA_WTI = os.environ.get("TWELVEDATA_WTI", "WTI/USD").strip()
-TWELVEDATA_BRENT = os.environ.get("TWELVEDATA_BRENT", "XBR/USD").strip()
 
 # Seuil d'ancienneté (jours) au-delà duquel une carte pétrole est marquée stale.
-# Il signale une donnée qui cesse VRAIMENT d'avancer (flux EIA cassé, clé morte),
-# PAS le lag de publication normal de l'EIA (~1 semaine) quand aucune source temps
-# réel n'est branchée : sinon le badge stale serait permanent et ne voudrait plus
-# rien dire. Défaut 10 j = large marge au-dessus du lag habituel de l'EIA (~7 j).
+# Il signale une donnée qui cesse vraiment d'avancer (flux EIA cassé, clé morte),
+# pas son délai de publication normal. Défaut 10 j = marge au-dessus du lag EIA.
 STALE_MAX_AGE_DAYS = int(os.environ.get("ENERGIE_STALE_MAX_AGE", "10"))
+
+# Une observation EIA de moins de quatre jours est nominale (week-end inclus).
+# Au-delà, elle reste valide mais son retard est publié explicitement.
+EIA_OIL_DELAY_DAYS = int(os.environ.get("ENERGIE_EIA_OIL_DELAY_DAYS", "3"))
 
 # Ancienneté maximale d'un point déjà publié pour qu'un échec de collecte
 # ponctuel ne l'exclue pas à tort du composite. Ces seuils suivent la cadence
 # normale de chaque source, pas la fréquence du timer (30 min).
 FALLBACK_MAX_AGE_DAYS = {
+    "brent": STALE_MAX_AGE_DAYS,
+    "wti": STALE_MAX_AGE_DAYS,
     "crude_stocks_us": 10,   # EIA hebdomadaire
     "henry_hub": 7,          # EIA quotidienne, avec week-ends et délai de publication
     "gas_storage_eu": 2,     # GIE quotidienne, deux publications le soir
@@ -369,120 +390,65 @@ FALLBACK_MAX_AGE_DAYS = {
 }
 
 
-def fetch_oilprice_latest(code):
-    """oilpriceapi.com : (date, prix) du dernier spot. None si indisponible.
-    Sert à rafraîchir la tête de série EIA avec un prix temps réel."""
-    if not OILPRICE_KEY:
-        return None
-    try:
-        url = "https://api.oilpriceapi.com/v1/prices/latest?by_code=" + urllib.parse.quote(code)
-        raw = http_get(url, headers={"Authorization": "Token " + OILPRICE_KEY})
-        d = json.loads(raw.decode("utf-8"))
-        if d.get("status") != "success":
-            return None
-        node = d.get("data", {})
-        price = node.get("price")
-        ts = node.get("created_at") or node.get("updated_at")
-        if price is None or not ts:
-            return None
-        day = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(timezone.utc).date()
-        return (day, float(price))
-    except Exception as e:  # noqa: BLE001
-        sys.stderr.write("[info] oilpriceapi %s KO (%s)\n" % (code, _safe_err(e)))
-        return None
+EIA_OIL_SERIES = {
+    "brent": "RBRTE",
+    "wti": "RWTC",
+}
 
 
-# Source effective du dernier point de chaque série pétrole, renseignée par
-# _freshen_tip / fetch_* et relue dans collect() pour signaler un repli.
-#   "oilpriceapi" | "yahoo" -> spot temps réel ; "eia" -> repli laggé.
-TIP_SOURCE = {}
+def _fetch_eia_oil_spot_uncached(series, length=900):
+    """Prix spot quotidien EIA v2 natif, ancien vers récent.
+
+    La route, la fréquence, la série et l'unité sont validées avant qu'un
+    point puisse entrer dans le score.
+    """
+    if not EIA_KEY:
+        raise RuntimeError("EIA_KEY absente")
+    if series not in EIA_OIL_SERIES.values():
+        raise ValueError("série pétrole EIA non autorisée: %s" % series)
+    qs = urllib.parse.urlencode([
+        ("api_key", EIA_KEY),
+        ("frequency", "daily"),
+        ("data[0]", "value"),
+        ("facets[series][]", series),
+        ("sort[0][column]", "period"),
+        ("sort[0][direction]", "desc"),
+        ("length", str(length)),
+    ])
+    data = http_json("https://api.eia.gov/v2/petroleum/pri/spt/data/?" + qs)
+    response = data.get("response") or {}
+    if response.get("frequency") != "daily":
+        raise RuntimeError("fréquence EIA pétrole inattendue")
+    out = []
+    for row in response.get("data") or []:
+        if row.get("series") != series or row.get("units") != "$/BBL":
+            continue
+        day = iso_to_date(row.get("period"))
+        value = fnum(row.get("value"))
+        if day and value is not None and math.isfinite(value):
+            out.append((day, value))
+    if not out:
+        raise RuntimeError("aucun prix spot EIA exploitable pour %s" % series)
+    out.sort(key=lambda item: item[0])
+    return drop_outliers(out)
 
 
-def fetch_twelvedata_tip(symbol):
-    """Twelve Data /quote : (date, prix) du dernier point spot. None si indisponible.
-    Repli quand oilpriceapi est HS ; server-friendly (contrairement à Yahoo)."""
-    if not TWELVEDATA_KEY or not symbol:
-        return None
-    try:
-        url = ("https://api.twelvedata.com/quote?symbol=%s&apikey=%s"
-               % (urllib.parse.quote(symbol), urllib.parse.quote(TWELVEDATA_KEY)))
-        d = json.loads(http_get(url).decode("utf-8"))
-        if str(d.get("status")) == "error" or d.get("code") not in (None, 200):
-            sys.stderr.write("[info] twelvedata %s KO (%s)\n"
-                             % (symbol, _safe_err(d.get("message") or d)))
-            return None
-        price = fnum(d.get("close") if d.get("close") is not None else d.get("price"))
-        if price is None:
-            return None
-        ts = d.get("timestamp")
-        if ts:
-            day = datetime.fromtimestamp(int(ts), tz=timezone.utc).date()
-        else:
-            day = iso_to_date(d.get("datetime")) or datetime.now(timezone.utc).date()
-        return (day, float(price))
-    except Exception as e:  # noqa: BLE001
-        sys.stderr.write("[info] twelvedata %s KO (%s)\n" % (symbol, _safe_err(e)))
-        return None
-
-
-def _yahoo_tip(symbol):
-    """Dernier point Yahoo comme spot frais de repli. None si Yahoo KO/banni."""
-    try:
-        pairs = fetch_yahoo(symbol, rng="5d")
-        return pairs[-1] if pairs else None
-    except Exception as e:  # noqa: BLE001
-        sys.stderr.write("[info] Yahoo tip %s KO (%s)\n" % (symbol, _safe_err(e)))
-        return None
-
-
-def _freshen_tip(name, series, code, td_symbol, yahoo_symbol):
-    """Rafraîchit la tête de série EIA avec un spot temps réel.
-    Chaîne : oilpriceapi -> Twelve Data -> Yahoo. Si toutes tombent, on garde
-    l'EIA seul (laggé) et on le signale explicitement (TIP_SOURCE + stderr)."""
-    tip, src = fetch_oilprice_latest(code), "oilpriceapi"
-    if not tip:
-        tip, src = fetch_twelvedata_tip(td_symbol), "twelvedata"
-    if not tip:
-        tip, src = _yahoo_tip(yahoo_symbol), "yahoo"
-    if not tip:
-        TIP_SOURCE[name] = "eia"
-        last = series[-1][0].isoformat() if series else "?"
-        sys.stderr.write(
-            "[warn] %s: spot temps reel indisponible (oilpriceapi + twelvedata + "
-            "Yahoo KO), repli EIA seul, dernier point %s\n" % (name, last))
-        return series
-    TIP_SOURCE[name] = src
-    day, price = tip
-    series = [(d, v) for (d, v) in series if d < day]
-    series.append((day, price))
-    series.sort(key=lambda t: t[0])
-    return series
+def fetch_eia_oil_spot(series, length=900):
+    """Prix spot quotidien EIA, avec contrôle réseau plafonné et cache atomique."""
+    return _fetch_eia_cached(
+        series,
+        lambda: _fetch_eia_oil_spot_uncached(series, length=length),
+    )
 
 
 def fetch_brent():
-    """Brent : historique EIA + tête de série spot temps réel (oilpriceapi -> Yahoo)."""
-    if USE_YAHOO_OIL:
-        try:
-            pairs = fetch_yahoo("BZ=F")
-            TIP_SOURCE["brent"] = "yahoo"
-            return pairs
-        except Exception as e:  # noqa: BLE001
-            sys.stderr.write("[info] Yahoo Brent KO (%s), repli EIA+oilpriceapi\n" % _safe_err(e))
-    return _freshen_tip("brent", fetch_eia_series("PET.RBRTE.D"),
-                        "BRENT_CRUDE_USD", TWELVEDATA_BRENT, "BZ=F")
+    """Brent Europe spot EIA quotidien (RBRTE)."""
+    return fetch_eia_oil_spot(EIA_OIL_SERIES["brent"])
 
 
 def fetch_wti():
-    """WTI : historique EIA + tête de série spot temps réel (oilpriceapi -> Yahoo)."""
-    if USE_YAHOO_OIL:
-        try:
-            pairs = fetch_yahoo("CL=F")
-            TIP_SOURCE["wti"] = "yahoo"
-            return pairs
-        except Exception as e:  # noqa: BLE001
-            sys.stderr.write("[info] Yahoo WTI KO (%s), repli EIA+oilpriceapi\n" % _safe_err(e))
-    return _freshen_tip("wti", fetch_eia_series("PET.RWTC.D"),
-                        "WTI_USD", TWELVEDATA_WTI, "CL=F")
+    """WTI Cushing spot EIA quotidien (RWTC)."""
+    return fetch_eia_oil_spot(EIA_OIL_SERIES["wti"])
 
 
 def fetch_gie_eu_storage():
@@ -707,16 +673,40 @@ def cached_fallback(previous, source_error, max_age_days=None):
 def annotate_oil_provenance(series, notes):
     """Expose la source et le retard du dernier point Brent/WTI.
 
-    Le seuil ``stale`` reste réservé à une vraie rupture EIA. Le repli EIA
-    normal est néanmoins visible comme qualité différée dans le snapshot.
+    Le seuil ``stale`` reste réservé à une vraie rupture EIA. Un retard de
+    publication normal est visible comme ``official-delayed``. Un point du
+    snapshot précédent conservé après erreur reste explicitement
+    ``cached-current`` et ne se fait pas passer pour une collecte réussie.
     """
     for oil in ("brent", "wti"):
         s = series.get(oil)
-        if not s or s.get("stale"):
-            continue  # déjà en serve-stale (source complètement tombée)
-        s["tip_source"] = TIP_SOURCE.get(oil)
+        if not s:
+            continue
+        source_series = EIA_OIL_SERIES[oil]
+        meta = EIA_FETCH_META.get(source_series) or {}
+        s["tip_source"] = "eia"
+        s["source_series"] = source_series
+        if meta:
+            s["source_checked_at"] = meta.get("checked_at")
+            s["source_refresh_mode"] = meta.get("refresh_mode")
         s["age_days"] = age_days(s.get("date"))
-        if s["tip_source"] == "eia":
+
+        # Le fallback a déjà reçu sa qualification et son erreur source dans
+        # attempt(); on conserve cette vérité au lieu de la masquer.
+        if s.get("quality_status") == "cached-current":
+            continue
+
+        if s.get("stale") or (
+                s["age_days"] is not None
+                and s["age_days"] > STALE_MAX_AGE_DAYS):
+            s["stale"] = True
+            s["quality_status"] = "stale"
+            warning = "%s: donnee figee, dernier point %s (%s j, > %s j)" % (
+                oil, s.get("date"), s.get("age_days"), STALE_MAX_AGE_DAYS)
+            if not s.get("source_warning"):
+                s["source_warning"] = warning
+            notes.append(warning)
+        elif s["age_days"] is not None and s["age_days"] > EIA_OIL_DELAY_DAYS:
             s["quality_status"] = "official-delayed"
             warning = (
                 "%s: source EIA quotidienne officielle différée, dernier point %s (%s j)"
@@ -727,10 +717,6 @@ def annotate_oil_provenance(series, notes):
         else:
             s["quality_status"] = "nominal"
             s["source_warning"] = None
-        if s["age_days"] is not None and s["age_days"] > STALE_MAX_AGE_DAYS:
-            s["stale"] = True
-            notes.append("%s: donnee figee, dernier point %s (%s j, > %s j)"
-                         % (oil, s.get("date"), s["age_days"], STALE_MAX_AGE_DAYS))
 
 
 def collect():
@@ -773,17 +759,14 @@ def collect():
 
     # --- Pétrole ---
     brent = attempt("brent", fetch_brent,
-                    unit="$/bbl", direction=1.0, label="Brent · spot")
+                    unit="$/bbl", direction=1.0, label="Brent · spot EIA")
     wti = attempt("wti", fetch_wti,
-                  unit="$/bbl", direction=1.0, label="WTI · spot")
+                  unit="$/bbl", direction=1.0, label="WTI · spot EIA")
     attempt("crude_stocks_us", lambda: fetch_eia_series("PET.WCESTUS1.W"),
             unit="kb", direction=-1.0, label="Stocks brut US (hors SPR)")
-    # Transparence + fraîcheur des cartes pétrole. On expose toujours la source
-    # effective du dernier point (tip_source : oilpriceapi/twelvedata/yahoo/eia)
-    # et son ancienneté (age_days), quel que soit l'état. Le badge stale, lui, ne
-    # se déclenche QUE si la donnée cesse réellement d'avancer (age > seuil) :
-    # le repli EIA à son lag normal (~7 j) reste une donnée valide et datée,
-    # signalée comme official-delayed sans être assimilée à une rupture.
+    # Transparence + fraîcheur des cartes pétrole. La source EIA, la série, le
+    # dernier contrôle réseau/cache et l'ancienneté du point sont publiés. Le
+    # badge stale ne se déclenche que si la donnée cesse réellement d'avancer.
     annotate_oil_provenance(series, notes)
 
     if brent and wti:
